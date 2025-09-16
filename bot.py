@@ -15,6 +15,8 @@ from bs4 import BeautifulSoup
 PESSOAS_PARA_BUSCAR = [
     {'nome': "Gustavo Henrique Marinho de Oliveira", 'inscricao': "2110632", 'cpf': ""},
     {'nome': "Larissa Peixoto Soares", 'inscricao': "2110634", 'cpf': ""},
+    {'nome': "Simone Peixoto Pedroza", 'inscricao': "", 'cpf': ""},
+    {'nome': "Marise dos Santos Marinho", 'inscricao': "", 'cpf': ""},
      
 ]
 

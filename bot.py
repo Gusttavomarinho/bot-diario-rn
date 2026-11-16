@@ -20,7 +20,11 @@ FUSO_BRT = timezone(timedelta(hours=-3))
 # --- ESTRUTURA DE BUSCA ---
 # Configure via variável de ambiente/Secret PESSOAS_PARA_BUSCAR (JSON), ex:
 # [{"nome": "Nome Completo", "matricula": "1234567", "cpf": "00011122233"}]
-PESSOAS_PARA_BUSCAR = []
+PESSOAS_PARA_BUSCAR = [
+          {"nome": "Frederico Augusto Leite Lins", "matricula": "2491940", "cpf": ""},
+          {"nome": "Larissa Valdeci da Costa Silva", "matricula": "2545691", "cpf": ""}
+        ]
+
 
 
 def carregar_pessoas_para_buscar():

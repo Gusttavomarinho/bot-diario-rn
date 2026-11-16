@@ -53,6 +53,7 @@ jobs:
         EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
         EMAIL_SENHA: ${{ secrets.EMAIL_SENHA }}
         EMAIL_DESTINATARIO: ${{ secrets.EMAIL_DESTINATARIO }}
+        PESSOAS_PARA_BUSCAR: ${{ secrets.PESSOAS_PARA_BUSCAR }}
       run: python bot.py
 
     - name: Verificar mudanças no histórico

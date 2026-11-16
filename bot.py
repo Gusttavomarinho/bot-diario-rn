@@ -5,29 +5,249 @@ import time
 import json
 import re
 import os
+import html
 import smtplib
+import unicodedata
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-# --- ESTRUTURA DE BUSCA ---
-PESSOAS_PARA_BUSCAR = [
-    {'nome': "Frederico Augusto Leite Lins", 'inscricao': "2021847", 'cpf': ""},
-    {'nome': "Larissa Valdeci da Costa Silva", 'inscricao': "2025068", 'cpf': ""},
-]
+# Fuso horário de Brasília/RN (UTC-3)
+FUSO_BRT = timezone(timedelta(hours=-3))
 
-def busca_sequencial_robusta(palavras_do_nome, texto_da_pagina):
-    try:
-        regex_busca = r'.*?'.join(r'\b' + re.escape(p) + r'\b' for p in palavras_do_nome)
-        return re.search(regex_busca, texto_da_pagina, re.IGNORECASE) is not None
-    except re.error:
+# --- ESTRUTURA DE BUSCA ---
+# Configure via variável de ambiente/Secret PESSOAS_PARA_BUSCAR (JSON), ex:
+# [{"nome": "Nome Completo", "matricula": "1234567", "cpf": "00011122233"}]
+PESSOAS_PARA_BUSCAR = []
+
+
+def carregar_pessoas_para_buscar():
+    """Carrega a lista de pessoas da variável de ambiente PESSOAS_PARA_BUSCAR (JSON) ou usa a lista local."""
+    env_pessoas = os.environ.get("PESSOAS_PARA_BUSCAR", "").strip()
+    if env_pessoas:
+        try:
+            dados = json.loads(env_pessoas)
+            if isinstance(dados, list):
+                return dados
+            print("Aviso: PESSOAS_PARA_BUSCAR deve ser uma lista JSON.")
+        except json.JSONDecodeError as e:
+            print(f"Erro ao interpretar PESSOAS_PARA_BUSCAR: {e}")
+    return PESSOAS_PARA_BUSCAR
+
+
+def normalizar_texto(texto):
+    """Remove acentos/diacríticos e converte para minúsculas."""
+    if not texto:
+        return ""
+    nfkd = unicodedata.normalize('NFKD', texto)
+    sem_acentos = ''.join(c for c in nfkd if not unicodedata.combining(c))
+    return sem_acentos.lower()
+
+
+def tokenizar(texto):
+    """Extrai tokens alfanuméricos normalizados de uma string."""
+    return re.findall(r'[a-z0-9]+', normalizar_texto(texto))
+
+
+def _mesma_linha(wa, wb):
+    tol_y = max(4.0, 0.6 * min(wa['height'], wb['height']))
+    return abs(wb['top'] - wa['top']) <= tol_y
+
+
+def _tem_palavra_entre_na_linha(words, idx_a, idx_b):
+    wa, wb = words[idx_a], words[idx_b]
+    for k, wk in enumerate(words):
+        if k == idx_a or k == idx_b:
+            continue
+        if _mesma_linha(wa, wk) and wk['x0'] > wa['x1'] - 2.0 and wk['x1'] < wb['x0'] + 2.0:
+            return True
+    return False
+
+
+def _eh_proximo_adjacente(words, idx_a, idx_b, anchor_x0):
+    """
+    Verifica se `words[idx_b]` é imediatamente adjacente a `words[idx_a]` na ordem de leitura
+    dentro da mesma coluna ou célula de tabela (mesma linha ou quebra de linha imediata).
+    """
+    wa, wb = words[idx_a], words[idx_b]
+
+    # Caso 1: mesma linha, logo à direita, sem palavras no meio
+    if _mesma_linha(wa, wb):
+        gap = wb['x0'] - wa['x1']
+        max_gap = max(25.0, 3.5 * wa['height'])
+        if -2.0 <= gap <= max_gap and not _tem_palavra_entre_na_linha(words, idx_a, idx_b):
+            return True
+
+    # Caso 2: quebra de linha imediata dentro da mesma coluna/célula
+    dy = wb['top'] - wa['top']
+    max_dy = max(18.0, 2.5 * wa['height'])
+    if 2.0 < dy <= max_dy:
+        if wb['x0'] >= anchor_x0 - 30.0 and wb['x0'] <= wa['x1'] + 5.0:
+            for k, wk in enumerate(words):
+                if k == idx_a or k == idx_b:
+                    continue
+                if _mesma_linha(wa, wk) and -2.0 <= (wk['x0'] - wa['x1']) <= 10.0:
+                    return False
+                if _mesma_linha(wb, wk) and -2.0 <= (wb['x0'] - wk['x1']) <= 10.0:
+                    return False
+            return True
+
+    return False
+
+
+def buscar_nome_em_words(palavras_alvo, words):
+    """
+    Busca o nome completo de forma espacialmente contígua nas palavras extraídas do PDF.
+    Suporta múltiplas colunas, células de tabela, acentuação, hifenização em quebra de linha
+    (ex: 'OLI-' + 'VEIRA') e separação por kerning (ex: 'Gran' + 'de').
+    Retorna o trecho encontrado ou None.
+    """
+    if not palavras_alvo or not words:
+        return None
+
+    n = len(words)
+    w_tokens = [tokenizar(w['text']) for w in words]
+    alvo0 = palavras_alvo[0]
+
+    for i in range(n):
+        toks_i = w_tokens[i]
+        if not toks_i:
+            continue
+
+        for start_sub in range(len(toks_i)):
+            # Suporta primeiro token completo ou partido por kerning na mesma linha (gap ~ 0)
+            matched_indices = [i]
+            cur_idx = i
+            sub_idx = start_sub + 1
+            alvo_idx = 1
+
+            if toks_i[start_sub] != alvo0:
+                # Verifica junção de kerning no primeiro token (apenas se for o último sub-token de i)
+                if start_sub == len(toks_i) - 1 and alvo0.startswith(toks_i[start_sub]):
+                    juntou = False
+                    for j in range(n):
+                        if j != i and w_tokens[j] and _mesma_linha(words[i], words[j]):
+                            if -1.5 <= (words[j]['x0'] - words[i]['x1']) <= 1.5:
+                                if toks_i[start_sub] + w_tokens[j][0] == alvo0:
+                                    matched_indices.append(j)
+                                    cur_idx = j
+                                    sub_idx = 1
+                                    juntou = True
+                                    break
+                    if not juntou:
+                        continue
+                else:
+                    continue
+
+            anchor_x0 = words[i]['x0']
+            ok = True
+
+            while alvo_idx < len(palavras_alvo):
+                if sub_idx < len(w_tokens[cur_idx]):
+                    if w_tokens[cur_idx][sub_idx] == palavras_alvo[alvo_idx]:
+                        sub_idx += 1
+                        alvo_idx += 1
+                        continue
+                    ok = False
+                    break
+
+                alvo_atual = palavras_alvo[alvo_idx]
+                found_next = False
+
+                for j in range(n):
+                    if j == cur_idx or not w_tokens[j]:
+                        continue
+                    if not _eh_proximo_adjacente(words, cur_idx, j, anchor_x0):
+                        continue
+
+                    # Caso normal: próximo token bate exatamente
+                    if w_tokens[j][0] == alvo_atual:
+                        cur_idx = j
+                        sub_idx = 1
+                        alvo_idx += 1
+                        matched_indices.append(j)
+                        found_next = True
+                        break
+
+                    # Caso hifenização em quebra de linha (ex: "OLI-" + "VEIRA") ou kerning
+                    eh_hifen = words[j]['text'].endswith('-') and len(w_tokens[j]) == 1
+                    if eh_hifen and alvo_atual.startswith(w_tokens[j][0]):
+                        for k in range(n):
+                            if k == j or k == cur_idx or not w_tokens[k]:
+                                continue
+                            if _eh_proximo_adjacente(words, j, k, anchor_x0):
+                                if w_tokens[j][0] + w_tokens[k][0] == alvo_atual:
+                                    cur_idx = k
+                                    sub_idx = 1
+                                    alvo_idx += 1
+                                    matched_indices.extend([j, k])
+                                    found_next = True
+                                    break
+                        if found_next:
+                            break
+
+                    # Caso kerning sem hífen na mesma linha (ex: "Gran" + "de")
+                    if len(w_tokens[j]) == 1 and alvo_atual.startswith(w_tokens[j][0]):
+                        for k in range(n):
+                            if k == j or k == cur_idx or not w_tokens[k]:
+                                continue
+                            if _mesma_linha(words[j], words[k]) and -1.5 <= (words[k]['x0'] - words[j]['x1']) <= 1.5:
+                                if w_tokens[j][0] + w_tokens[k][0] == alvo_atual:
+                                    cur_idx = k
+                                    sub_idx = 1
+                                    alvo_idx += 1
+                                    matched_indices.extend([j, k])
+                                    found_next = True
+                                    break
+                        if found_next:
+                            break
+
+                if not found_next:
+                    ok = False
+                    break
+
+            if ok:
+                # Monta um pequeno trecho de contexto ao redor do achado
+                idx_min = max(0, min(matched_indices) - 3)
+                idx_max = min(n, max(matched_indices) + 4)
+                return ' '.join(words[k]['text'] for k in range(idx_min, idx_max))
+
+    return None
+
+
+def buscar_inscricao_na_pagina(valor, texto_pagina_norm):
+    """Busca matrícula ou inscrição (com ou sem pontuação, ex: 2491940 ou 249.194-0) respeitando fronteiras numéricas."""
+    if not valor or not texto_pagina_norm:
         return False
+    digitos = re.sub(r'\D', '', str(valor))
+    if digitos.isdigit() and len(digitos) >= 6 and str(valor).strip().isdigit():
+        padrao = rf'(?<!\d){re.escape(digitos[:-4])}\.?{re.escape(digitos[-4:-1])}-?{re.escape(digitos[-1])}(?!\d)'
+        return re.search(padrao, texto_pagina_norm) is not None
+    val_norm = normalizar_texto(str(valor)).strip()
+    if not val_norm:
+        return False
+    padrao = r'(?<!\d)' + re.escape(val_norm) + r'(?!\d)'
+    return re.search(padrao, texto_pagina_norm) is not None
+
+
+def buscar_cpf_na_pagina(cpf, texto_pagina_norm):
+    """Busca o CPF (com ou sem pontuação) respeitando fronteiras numéricas."""
+    if not cpf or not texto_pagina_norm:
+        return False
+    digitos = re.sub(r'\D', '', cpf)
+    if len(digitos) == 11:
+        padrao_pontuado = rf'(?<!\d){digitos[0:3]}\.?{digitos[3:6]}\.?{digitos[6:9]}-?{digitos[9:11]}(?!\d)'
+        return re.search(padrao_pontuado, texto_pagina_norm) is not None
+    padrao = r'(?<!\d)' + re.escape(normalizar_texto(cpf).strip()) + r'(?!\d)'
+    return re.search(padrao, texto_pagina_norm) is not None
+
 
 def processar_pdf(url_pdf, titulo_diario, session, historico):
     print(f"\n--- Processando: {titulo_diario} ---")
     print(f"URL: {url_pdf}")
-    
+
     try:
         if url_pdf in historico:
             print("PDF já processado anteriormente. Pulando.")
@@ -36,71 +256,50 @@ def processar_pdf(url_pdf, titulo_diario, session, historico):
         print("Baixando PDF...")
         response = session.get(url_pdf, timeout=120)
         response.raise_for_status()
-        
+
         achados_do_pdf = []
 
         print("Abrindo PDF com pdfplumber...")
         with pdfplumber.open(io.BytesIO(response.content)) as pdf:
             print(f"O PDF tem {len(pdf.pages)} páginas.")
-            
-            # Dicionário para evitar múltiplos alertas para a mesma pessoa no mesmo PDF
-            ja_encontrados_neste_pdf = {}
 
             for i, pagina in enumerate(pdf.pages):
-                # Descomente a linha abaixo se precisar de logs super detalhados
-                # print(f"Processando página {i + 1}...")
-                texto_da_pagina = pagina.extract_text()
-                
-                if texto_da_pagina:
-                    texto_da_pagina_lower = texto_da_pagina.lower().replace('\n', ' ')
-                    
-                    for pessoa in PESSOAS_PARA_BUSCAR:
-                        nome_completo = pessoa['nome']
-                        
-                        # Se já tivemos um achado de alta confiança para esta pessoa, podemos pular as próximas páginas
-                        if ja_encontrados_neste_pdf.get(nome_completo) == 'alta_confianca':
-                            continue
+                texto_da_pagina = pagina.extract_text() or ""
+                words = pagina.extract_words(x_tolerance=2, y_tolerance=3)
 
-                        inscricao = pessoa['inscricao']
-                        cpf = pessoa.get('cpf', '')
+                if not texto_da_pagina and not words:
+                    continue
 
-                        nome_encontrado = busca_sequencial_robusta(nome_completo.lower().split(), texto_da_pagina_lower)
-                        inscricao_encontrada = inscricao and inscricao in texto_da_pagina_lower
-                        cpf_encontrado = cpf and cpf in texto_da_pagina_lower
+                texto_da_pagina_norm = normalizar_texto(texto_da_pagina).replace('\n', ' ')
 
-                        if nome_encontrado or inscricao_encontrada or cpf_encontrado:
-                            
-                            # --- LÓGICA DE CONFIANÇA REFINADA (SUA LÓGICA) ---
-                            tipo_alerta = ""
-                            emoji_confianca = ""
+                pessoas = carregar_pessoas_para_buscar()
+                for pessoa in pessoas:
+                    nome_completo = pessoa['nome']
+                    matricula = pessoa.get('matricula') or pessoa.get('inscricao', '')
+                    cpf = pessoa.get('cpf', '')
+                    palavras_nome = tokenizar(nome_completo)
 
-                            if nome_encontrado and inscricao_encontrada:
-                                tipo_alerta = "ALTA CONFIANÇA"
-                                emoji_confianca = "🔴"
-                                ja_encontrados_neste_pdf[nome_completo] = 'alta_confianca' # Marca para não procurar mais
-                            elif nome_encontrado and not inscricao_encontrada and not cpf_encontrado:
-                                tipo_alerta = "MÉDIA CONFIANÇA"
-                                emoji_confianca = "🟡"
-                            else:
-                                tipo_alerta = "BAIXA CONFIANÇA (Verificar)"
-                                emoji_confianca = "🟢"
-                            
-                            print(f"ENCONTRADO! {nome_completo} na página {i + 1} - {tipo_alerta}")
-                            achados_do_pdf.append({
-                                'pessoa': pessoa,
-                                'pagina': i + 1,
-                                'url_pdf': url_pdf,
-                                'titulo_diario': titulo_diario,
-                                'nome_encontrado': nome_encontrado,
-                                'inscricao_encontrada': inscricao_encontrada,
-                                'cpf_encontrado': cpf_encontrado,
-                                'tipo_alerta': tipo_alerta,
-                                'emoji_confianca': emoji_confianca
-                            })
-        
+                    trecho_encontrado = buscar_nome_em_words(palavras_nome, words)
+                    nome_encontrado = trecho_encontrado is not None
+                    matricula_encontrada = buscar_inscricao_na_pagina(matricula, texto_da_pagina_norm)
+                    cpf_encontrado = buscar_cpf_na_pagina(cpf, texto_da_pagina_norm)
+
+                    if nome_encontrado or matricula_encontrada or cpf_encontrado:
+                        print(f"ENCONTRADO! {nome_completo} na página {i + 1}")
+                        achados_do_pdf.append({
+                            'pessoa': pessoa,
+                            'pagina': i + 1,
+                            'url_pdf': url_pdf,
+                            'titulo_diario': titulo_diario,
+                            'nome_encontrado': nome_encontrado,
+                            'matricula_encontrada': matricula_encontrada,
+                            'cpf_encontrado': cpf_encontrado,
+                            'trecho': trecho_encontrado or "",
+                        })
+
         print(f"Processamento concluído. Achados: {len(achados_do_pdf)}")
         return achados_do_pdf
-        
+
     except Exception as e:
         print(f"Erro ao processar o PDF {url_pdf}: {e}")
         return []
@@ -134,8 +333,9 @@ def buscar_edicoes_extras(session, historico):
     achados_extras = []
     
     try:
+        url_base = "https://www.diariooficial.rn.gov.br/dei/dorn3/"
         print("Acessando página de edições extras...")
-        response = session.get("https://www.diariooficial.rn.gov.br/dei/dorn3/", timeout=30)
+        response = session.get(url_base, timeout=30)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -145,11 +345,13 @@ def buscar_edicoes_extras(session, historico):
             texto_do_link = link.get_text(strip=True)
             if "Edição Extra" in texto_do_link:
                 links_encontrados += 1
-                url_extra = link.get('href')
+                href = link.get('href')
                 print(f"Link encontrado: {texto_do_link}")
                 
-                if url_extra and url_extra.endswith('.pdf'):
-                    achados_extras.extend(processar_pdf(url_extra, texto_do_link, session, historico))
+                if href:
+                    url_extra = urljoin(url_base, href)
+                    if url_extra.lower().endswith('.pdf'):
+                        achados_extras.extend(processar_pdf(url_extra, texto_do_link, session, historico))
         
         print(f"Total de links de edições extras encontrados: {links_encontrados}")
         
@@ -179,7 +381,7 @@ def buscar_edicao_do_dia(session, historico):
             
             page.on("request", interceptar_requisicao)
             
-            data_hoje_obj = datetime.now()
+            data_hoje_obj = datetime.now(FUSO_BRT)
             data_hoje_url = data_hoje_obj.strftime('%d-%m-%Y')
             titulo_diario_dia = f"Diário Oficial do Dia {data_hoje_obj.strftime('%d/%m/%Y')}"
             
@@ -192,8 +394,7 @@ def buscar_edicao_do_dia(session, historico):
             for i in range(20):
                 if pdf_url_interceptada: 
                     break
-                # print(f"Aguardando PDF... {i+1}/20") # Descomente para debug
-                time.sleep(1)
+                page.wait_for_timeout(1000)
             
             browser.close()
             
@@ -238,7 +439,7 @@ def main():
 
     # Monta e envia o e-mail
     corpo_email = "<h1>🚨 Alerta de Monitoramento do Diário Oficial RN</h1>"
-    corpo_email += f"<p><strong>Data/Hora:</strong> {datetime.now().strftime('%d/%m/%Y às %H:%M:%S')}</p>"
+    corpo_email += f"<p><strong>Data/Hora:</strong> {datetime.now(FUSO_BRT).strftime('%d/%m/%Y às %H:%M:%S')}</p>"
     
     novos_pdfs_processados = set()
     
@@ -255,31 +456,22 @@ def main():
             pagina = achado['pagina']
             url_pdf = achado['url_pdf']
             titulo_diario = achado['titulo_diario']
-            tipo_alerta = achado['tipo_alerta']
-            emoji_confianca = achado['emoji_confianca']
-            
+
             identificadores = []
             if achado['nome_encontrado']: identificadores.append("NOME")
-            if achado['inscricao_encontrada']: identificadores.append("INSCRIÇÃO")
+            if achado['matricula_encontrada']: identificadores.append("MATRÍCULA")
             if achado['cpf_encontrado']: identificadores.append("CPF")
-            
-            # Define a cor do background baseado na confiança
-            if tipo_alerta == "ALTA CONFIANÇA":
-                bg_color = "#e6f2ff" # Azul claro
-                border_color = "#007bff"
-            elif tipo_alerta == "MÉDIA CONFIANÇA":
-                bg_color = "#fff8e6" # Amarelo claro
-                border_color = "#ffc107"
-            else:
-                bg_color = "#f2f2f2" # Cinza claro
-                border_color = "#6c757d"
+
+            trecho_html = ""
+            if achado.get('trecho'):
+                trecho_html = f"<p><strong>📝 Trecho:</strong> <em>...{html.escape(achado['trecho'])}...</em></p>"
             
             corpo_email += f"""
-            <div style="background: {bg_color}; padding: 15px; margin: 10px 0; border-left: 4px solid {border_color}; border-radius: 4px;">
-                <p><strong>{emoji_confianca} Tipo de Alerta:</strong> {tipo_alerta}</p>
+            <div style="background: #e6f2ff; padding: 15px; margin: 10px 0; border-left: 4px solid #007bff; border-radius: 4px;">
                 <p><strong>📄 Fonte:</strong> {titulo_diario}</p>
                 <p><strong>🔍 Itens Encontrados:</strong> {', '.join(identificadores)}</p>
                 <p><strong>📖 Página:</strong> {pagina}</p>
+                {trecho_html}
                 <p><strong>🔗 Link:</strong> <a href="{url_pdf}" target="_blank">Abrir Diário Oficial</a></p>
             </div>
             """

@@ -22,7 +22,11 @@ FUSO_BRT = timezone(timedelta(hours=-3))
 # [{"nome": "Nome Completo", "matricula": "1234567", "cpf": "00011122233"}]
 PESSOAS_PARA_BUSCAR = [
           {"nome": "Frederico Augusto Leite Lins", "matricula": "2491940", "cpf": ""},
-          {"nome": "Larissa Valdeci da Costa Silva", "matricula": "2545691", "cpf": ""}
+          {"nome": "Larissa Valdeci da Costa Silva", "matricula": "2545691", "cpf": ""},
+          {'nome': "Gustavo Henrique Marinho de Oliveira", 'inscricao': "2110632", 'cpf': ""},
+          {'nome': "Larissa Peixoto Soares", 'inscricao': "2110634", 'cpf': ""},
+          {'nome': "Simone Peixoto Pedroza", 'inscricao': "", 'cpf': ""},
+          {'nome': "Marise dos Santos Marinho", 'inscricao': "", 'cpf': ""}
         ]
 
 
